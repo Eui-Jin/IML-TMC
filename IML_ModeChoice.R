@@ -1,0 +1,414 @@
+library(data.table)
+library(plyr)
+library(dplyr)
+library(caret)
+library(parallel)
+library(doParallel)
+library(foreach)
+library(iml)
+library(rsample)
+library(vip)
+library(xgboost)
+library(viridis)
+library(wesanderson)
+library(ranger)
+library(patchwork)
+library(yaImpute)
+
+## Setting the core for parallel processing
+set.seed(123)
+numCores = detectCores()-2
+cl = makeCluster(numCores)
+registerDoParallel(cl)
+
+
+df = fread("data_travelMode_2016_sampled.csv",sep=',',header = TRUE,fill=TRUE)
+
+## Remains only relevant columns
+df_model = df[,!(c("ID","Home_code","P_Depart_code","P_Arrival_code",
+                   "P_Trip_purpose","Home_type","P_Trip_seq","P_Home_Access",
+                   "start_time","P_Arr_LU3","P_Arr_Meanage","P_Arr_Older","Last_trip"))]
+
+## Transform the data types
+df_model$Home_car = factor(df_model$Home_car)
+df_model$Home_income = factor(df_model$Home_income)
+df_model$Home_drive = factor(df_model$Home_drive)
+df_model$Gender = factor(df_model$Gender)
+df_model$Max_seq = factor(df_model$Max_seq)
+df_model$P_Depart_time = factor(df_model$P_Depart_time)
+df_model$P_Depart_time = factor(df_model$P_Depart_time)
+df_model$M_Trip_mode_4 = factor(df_model$M_Trip_mode_4)
+df_model$P_Tour_type = factor(df_model$P_Tour_type)
+df_model$P_Trip_type = factor(df_model$P_Trip_type)
+
+
+
+## 1. Data preparation 
+# Remove the Minor class Taxi
+df_model = df_model[df_model$M_Trip_mode_4 != "Taxi",]
+
+
+df_model$M_Trip_mode_4 = factor(df_model$M_Trip_mode_4, levels = c("Auto","Bike","PT","Walk"), labels = c(0,1,2,3))
+
+colnames(df_model) = c("Income","Car_owener","Driver_license","Age","Gender","Number_of_trips",
+                          "Departure_time","Travel_time","Land_use_in_D_Residential","Land_use_in_D_Commerical",
+                          "Activity_duration","Population_density_at_D","Number_of_workers_at_D","Number_of_bus_stops_at_D","Number_of_subway_stops_at_D","M_Trip_mode_4",
+                          "Trip_type","Sum_of_travel_time","Sum_of_activity_duration","Tour_type")
+
+# Split the data into training and test-set
+
+set.seed(123)
+df_split <- initial_split(df_model, prop = .75)
+df_train <- training(df_split)
+df_test  <- testing(df_split)
+features <- setdiff(names(df_train), "M_Trip_mode_4")
+
+
+## 2. Modeling 
+## 2.1. Implementation of Random Forest
+## Hyper-parameter grids for Random Forest
+hyper_grid <- expand.grid(
+  num_trees  = seq(100, 300, by = 100),
+  mtry       = seq(12, 18, by = 3),
+  node_size  = seq(3, 9, by = 3),
+  max.depth  = c(50,100),
+  OOB_RMSE   = 0
+)
+
+
+## Define case.weight for imbalance travel modes
+MW = list()
+model_weights = rep(1,nrow(df_train))
+model_weights[df_train$M_Trip_mode_4 == 0] = 1/table(df_train$M_Trip_mode_4)[1]*0.25
+model_weights[df_train$M_Trip_mode_4 == 1] = 1/table(df_train$M_Trip_mode_4)[2]*0.25
+model_weights[df_train$M_Trip_mode_4 == 2] = 1/table(df_train$M_Trip_mode_4)[3]*0.25
+model_weights[df_train$M_Trip_mode_4 == 3] = 1/table(df_train$M_Trip_mode_4)[4]*0.25
+MW[[1]] = model_weights
+
+model_weights = rep(1,nrow(df_train))
+model_weights[df_train$M_Trip_mode_4 == 0] = 1/table(df_train$M_Trip_mode_4)[1]*1.0
+model_weights[df_train$M_Trip_mode_4 == 1] = 1/table(df_train$M_Trip_mode_4)[2]*0.25
+model_weights[df_train$M_Trip_mode_4 == 2] = 1/table(df_train$M_Trip_mode_4)[3]*1.0
+model_weights[df_train$M_Trip_mode_4 == 3] = 1/table(df_train$M_Trip_mode_4)[4]*1.0
+MW[[2]] = model_weights
+
+## Grid serach for paramter tuning
+for ( i in 1:nrow(hyper_grid))
+{
+  model = ranger(
+    formula = M_Trip_mode_4 ~ .,
+    data = df_train,
+    num.trees = hyper_grid$num_trees[i],
+    mtry = hyper_grid$mtry[i],
+    sample.fraction = 0.8,
+    min.node.size   = hyper_grid$node_size[i],
+    max.depth = hyper_grid$max.depth[i],
+    case.weights = model_weights
+  )
+
+  # add OOB error
+  hyper_grid$OOB_RMSE[i] = sqrt(model$prediction.error)
+}
+hyper_grid %>%
+  dplyr::arrange(OOB_RMSE) %>%
+  head(10)
+
+## Training the Best models
+st = Sys.time()
+rf_ranger = ranger(
+  formula = M_Trip_mode_4 ~ .,
+  data = df_train,
+  num.trees = 300,
+  mtry = 12,
+  sample.fraction = 0.8,
+  min.node.size   = 3,
+  max.depth = 50,
+  case.weights = model_weights,
+  verbose = TRUE
+)
+et = Sys.time()
+et-st
+
+
+# Define Pred function
+pred_ranger <- function(object, newdata)  {
+  results <- predict(object, newdata)$predictions
+  return(results)
+}
+
+value_rf = pred_ranger(rf_ranger,df_test)
+caret::confusionMatrix(data = value_rf,reference = df_test$M_Trip_mode_4)
+
+
+## 2.2 Implementation of XGboost
+
+## Hyper-parameter grids for XGboost
+hyper_grid <- expand.grid(
+  eta = c(.05, .1, .3),
+  max_depth = c(3, 5, 7),
+  min_child_weight = c(3, 5, 7),
+  subsample = c( .8, 1), 
+  colsample_bytree = c(.8, 1),
+  optimal_trees = 0,               # a place to dump results
+  min_RMSE = 0                     # a place to dump results
+)
+
+## The tuned parameters from server
+params <- list(
+  eta = 0.3,
+  max_depth = 11,
+  min_child_weight = 5,
+  subsample = 0.8,
+  colsample_bytree = 1
+)
+
+## Training the XGB using tuned parameters
+xgb.tune <- xgboost(
+  params = params,
+  data = data.matrix(subset(df_train, select = -M_Trip_mode_4)),
+  label = as.vector(df_train$M_Trip_mode_4),
+  nrounds = 500,
+  nfold = 4,
+  objective = "multi:softprob",  # for classification
+  verbose = 1,               # silent,
+  early_stopping_rounds = 50, # stop if no improvement for 10 consecutive trees
+  num_class = 4,
+  weight = model_weights*100000
+)
+
+
+pred <- predict(xgb.tune,data.matrix(subset(df_test, select = -M_Trip_mode_4)))
+pred = matrix(pred,ncol=4,byrow=TRUE)
+pred_labels = max.col(pred)-1
+value_xgb = factor(pred_labels,levels = levels(df_test$M_Trip_mode_4))
+caret::confusionMatrix(data = value_xgb,reference = df_test$M_Trip_mode_4)
+
+## XGB output function for probability
+
+pred_xgb_prob = function(object, newdata)  {
+  pred <- predict(object,data.matrix(subset(newdata, select = -M_Trip_mode_4)))
+  pred = matrix(pred,ncol=4,byrow=TRUE)
+  return(pred)
+}
+
+## XGB output function for one class
+pred_xgb = function(object, newdata)  {
+  pred <- predict(object,data.matrix(subset(newdata, select = -M_Trip_mode_4)))
+  pred = matrix(pred,ncol=4,byrow=TRUE)
+  pred_labels = max.col(pred)-1
+  pred = factor(pred_labels,levels = levels(df_test$M_Trip_mode_4))
+  return(pred)
+}
+
+pred_xgb_prob_int = function(object, newdata)  {
+  pred <- predict(object,data.matrix(newdata))
+  pred = matrix(pred,ncol=4,byrow=TRUE)
+  return(pred)
+}
+
+### Feature importance
+## Define Loss function for calculating feature importance
+## Balanced accuracy from the confusion matrix 
+
+Bal_AU <- function(actual, predicted) {
+  caret::confusionMatrix(predicted,actual)$byClass[1,11]
+}
+
+Bal_BI <- function(actual, predicted) {
+  caret::confusionMatrix(predicted,actual)$byClass[2,11]
+}
+
+Bal_PT <- function(actual, predicted) {
+  caret::confusionMatrix(predicted,actual)$byClass[3,11]
+}
+
+Bal_WL <- function(actual, predicted) {
+  caret::confusionMatrix(predicted,actual)$byClass[4,11]
+}
+
+Bal_All <- function(actual, predicted) {
+  mean(caret::confusionMatrix(predicted,actual)$byClass[,11])
+}
+
+
+
+
+## Interpretable Machine Learning (IML) methods
+
+df_test_x = subset(df_test, select = -M_Trip_mode_4)
+
+### XGB Predictor for all class 
+Predictor_xgb_prob = iml::Predictor$new(
+  model = xgb.tune,
+  data = df_test_x,
+  y = df_test$M_Trip_mode_4,
+  predict.fun = pred_xgb_prob_int,
+  type="prob")
+
+### XGB Predictor for Class 1
+Predictor_xgb_prob_0 = iml::Predictor$new(
+  model = xgb.tune,
+  data = df_test_x,
+  y = df_test$M_Trip_mode_4,
+  predict.fun = pred_xgb_prob_int,
+  type="prob",
+  class = 1)
+
+### XGB Predictor for Class 2
+Predictor_xgb_prob_1 = iml::Predictor$new(
+  model = xgb.tune,
+  data = df_test_x,
+  y = df_test$M_Trip_mode_4,
+  predict.fun = pred_xgb_prob_int,
+  type="prob",
+  class = 2)
+
+### XGB Predictor for Class 3
+Predictor_xgb_prob_2 = iml::Predictor$new(
+  model = xgb.tune,
+  data = df_test_x,
+  y = df_test$M_Trip_mode_4,
+  predict.fun = pred_xgb_prob_int,
+  type="prob",
+  class = 3)
+
+### XGB Predictor for Class 4
+Predictor_xgb_prob_3 = iml::Predictor$new(
+  model = xgb.tune,
+  data = df_test_x,
+  y = df_test$M_Trip_mode_4,
+  predict.fun = pred_xgb_prob_int,
+  type="prob",
+  class = 4)
+
+
+
+### Interaction
+## Takes quite long time 
+
+xgb_int_prob_0 = iml::Interaction$new(Predictor_xgb_prob_0)
+xgb_int_prob_1 = iml::Interaction$new(Predictor_xgb_prob_1)
+xgb_int_prob_2 = iml::Interaction$new(Predictor_xgb_prob_2)
+xgb_int_prob_3 = iml::Interaction$new(Predictor_xgb_prob_3)
+xgb_int_prob = iml::Interaction$new(Predictor_xgb_prob)
+
+## Load the pre-calculated adta
+par(mfrow =c(2,2))
+load("Results/XGB_Int_Class1.Rdata")
+plot(xgb_int_prob_0)
+load("Results/XGB_Int_Class2.Rdata")
+plot(xgb_int_prob_1)
+load("Results/XGB_Int_Class3.Rdata")
+plot(xgb_int_prob_2)
+load("Results/XGB_Int_Class4.Rdata")
+plot(xgb_int_prob_3)
+
+## Non-linear effects of independent variables (Accumulated Local effects (ALE) plots)
+### Main effect
+xgb_ale_prob_100 = iml::FeatureEffects$new(Predictor_xgb_prob,method = "ale", grid.size = 100)
+plot(xgb_ale_prob_100,features = c("Age","Number_of_trips","Sum_of_travel_time","Sum_of_activity_duration"),fixed_y = FALSE) 
+
+### Cross effects
+xlim_1 = quantile(df_test_x$Age, prob = c(0,0.9))[1]
+xlim_2 = quantile(df_test_x$Age, prob = c(0,0.9))[2]
+ylim_1 = quantile(df_test_x$Travel_time, prob = c(0,0.9))[1]
+ylim_2 = quantile(df_test_x$Travel_time, prob = c(0,0.9))[2]
+xgb_ale_prob_2d = FeatureEffect$new(Predictor_xgb_prob, c("Age", "Travel_time"), grid.size = 100)
+xgb_ale_prob_2d$results = xgb_ale_prob_2d$results[ xgb_ale_prob_2d$results$Age > xlim_1 & 
+                                                   xgb_ale_prob_2d$results$Age < xlim_2 &
+                                                   xgb_ale_prob_2d$results$Travel_time > ylim_1 &
+                                                   xgb_ale_prob_2d$results$Travel_time < ylim_2, ]
+
+xgb_ale_prob_2d$plot(show.data = FALSE) + 
+  scale_y_continuous("Travel_time")  + 
+  scale_x_continuous("Age") + 
+  scale_fill_gradientn(colours = pal) +
+  ylim(ylim_1,ylim_2) +
+  xlim(xlim_1,xlim_2)
+
+
+# Variable IMPortance for XGB
+
+# Re-define the prediction function for vip packages
+pred_xgb = function(object, newdata)  {
+  pred <- predict(object,data.matrix(subset(newdata, select = -M_Trip_mode_4)))
+  pred = matrix(pred,ncol=4,byrow=TRUE)
+  pred_labels = max.col(pred)-1
+  pred = factor(pred_labels,levels = c("0","1","2","3"))
+  return(pred)
+}
+
+xgb_imp_full = vip::vip(xgb.tune,
+                        train = df_test,
+                        target = df_test$M_Trip_mode_4,
+                        metric = Bal_All,
+                        method = "permute",
+                        nsim = 50,
+                        sample_frac = 0.5,
+                        pred_wrapper = pred_xgb,
+                        smaller_is_better = FALSE,
+                        geom = "boxplot",
+                        all_permutations = TRUE,
+                        mapping = aes_string(fill = "Variable"),
+                        aesthetics = list(color = "grey35")) + 
+                        ggtitle("XGB_IMP_FULL")
+xgb_imp_AU = vip::vip(xgb.tune,
+                        train = df_test,
+                        target = df_test$M_Trip_mode_4,
+                        metric = Bal_AU,
+                        method = "permute",
+                        nsim = 50,
+                        sample_frac = 0.5,
+                        pred_wrapper = pred_xgb,
+                        smaller_is_better = FALSE,
+                        geom = "boxplot",
+                        all_permutations = TRUE,
+                        mapping = aes_string(fill = "Variable"),
+                        aesthetics = list(color = "grey35")) + 
+                        ggtitle("XGB_IMP_AU")
+xgb_imp_BI = vip::vip(xgb.tune,
+                      train = df_test,
+                      target = df_test$M_Trip_mode_4,
+                      metric = Bal_BI,
+                      method = "permute",
+                      nsim = 50,
+                      sample_frac = 0.5,
+                      pred_wrapper = pred_xgb,
+                      smaller_is_better = FALSE,
+                      geom = "boxplot",
+                      all_permutations = TRUE,
+                      mapping = aes_string(fill = "Variable"),
+                      aesthetics = list(color = "grey35")) + 
+                      ggtitle("XGB_IMP_BI")
+xgb_imp_PT = vip::vip(xgb.tune,
+                      train = df_test,
+                      target = df_test$M_Trip_mode_4,
+                      metric = Bal_PT,
+                      method = "permute",
+                      nsim = 50,
+                      sample_frac = 0.5,
+                      pred_wrapper = pred_xgb,
+                      smaller_is_better = FALSE,
+                      geom = "boxplot",
+                      all_permutations = TRUE,
+                      mapping = aes_string(fill = "Variable"),
+                      aesthetics = list(color = "grey35")) + 
+                      ggtitle("XGB_IMP_BI")
+xgb_imp_WL = vip::vip(xgb.tune,
+                      train = df_test,
+                      target = df_test$M_Trip_mode_4,
+                      metric = Bal_WL,
+                      method = "permute",
+                      nsim = 50,
+                      sample_frac = 0.5,
+                      pred_wrapper = pred_xgb,
+                      smaller_is_better = FALSE,
+                      geom = "boxplot",
+                      all_permutations = TRUE,
+                      mapping = aes_string(fill = "Variable"),
+                      aesthetics = list(color = "grey35")) + 
+                      ggtitle("XGB_IMP_WL")
+save(xgb_imp_full,xgb_imp_AU,xgb_imp_BI,xgb_imp_PT,xgb_imp_WL,file="XGB_Imp.Rdata")
+
+load("Results/XGB_Imp.Rdata")
+plot(xgb_imp_full)
