@@ -1,4 +1,4 @@
-# Interpretable Machine Learning (IML) for Travel Mode Choice
+# Analysis of Travel Mode Choice in Seoul Using an Interpretable Machine Learning Approach
 
 This code implements the paper, Kim (2021). Analysis of Travel Mode Choice in Seoul Using an Interpretable Machine Learning Approach. Journal of Advanced Transportation. https://doi.org/10.1155/2021/6685004
 
